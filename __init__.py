@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 31),
+    "version":     (0, 5, 32),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -44,6 +44,11 @@ class PlanetsProperties(bpy.types.PropertyGroup):
     gear_elongation : FloatProperty(name="Gear Elongation", default=0.0,   min=0.0,   max=200.0,
                                     description="Extends each gear outward beyond the gear zone (mm)")
     anim_speed      : FloatProperty(name="Speed (deg/frame)", default=2.0, min=0.1,   max=30.0)
+    gear_retention  : BoolProperty (name="Retention System", default=False,
+                                    description="Add ring lip, sun lip, and planet chamfer to retain gears when inverted")
+    gear_tolerance  : FloatProperty(name="Retention Tolerance", default=0.15, min=0.0, max=2.0,
+                                    step=1,
+                                    description="Gap between chamfer face and lip underside (mm)")
 
 
 # ============================================================
@@ -215,6 +220,33 @@ def _make_circle_pts(r, segments=64):
     return [(r * math.cos(2*math.pi*i/segments),
              r * math.sin(2*math.pi*i/segments))
             for i in range(segments)]
+
+
+def _make_revolution_solid(name, profile_rz, segments=96):
+    """Revolve a closed polygon profile (list of (r,z) pairs) around the Z axis."""
+    bm = bmesh.new()
+    rings = []
+    for r, z in profile_rz:
+        rings.append([
+            bm.verts.new((r * math.cos(2*math.pi*k/segments),
+                          r * math.sin(2*math.pi*k/segments), z))
+            for k in range(segments)
+        ])
+    bm.verts.ensure_lookup_table()
+    n = len(rings)
+    for ri in range(n):
+        r0 = rings[ri]
+        r1 = rings[(ri + 1) % n]
+        for j in range(segments):
+            k = (j + 1) % segments
+            bm.faces.new([r0[j], r0[k], r1[k], r1[j]])
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    mesh = bpy.data.meshes.new(name + "_Mesh")
+    bm.to_mesh(mesh)
+    bm.free()
+    obj = bpy.data.objects.new(name, mesh)
+    _link(obj)
+    return obj
 
 
 def _make_bevel_gear(name, pts_top, pts_bot, gw, color, location, pts_ext=None, ext_local=0.0):
@@ -416,7 +448,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
                             (cone_r * (full_h + ring_void_bot) / full_h - wall)
                             / (T_ring / 2.0 + 1.25))
 
-        print(f"Planets v0.5.31 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
+        print(f"Planets v0.5.32 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
         print(f"  phi={math.degrees(phi):.1f}° hub_r={hub_r:.2f} hub_top={hub_top:.2f}")
         print(f"  z_outer={z_outer:.2f} z_ring_bot={z_ring_bot:.2f} ring_void_bot={ring_void_bot:.2f}")
         print(f"  ra_fill={ra_fill:.2f} ra_fill_bot={ra_fill_bot:.2f}")
@@ -451,6 +483,78 @@ class PLANETS_OT_generate(bpy.types.Operator):
         bpy.data.objects.remove(fill_obj, do_unlink=True)
         print(f"  fill UNION: verts {v_before}->{len(cone_obj.data.vertices)}")
 
+        # ── Retention geometry ──
+        # All retention geometry lives at z_lip = ext (the cone mouth after elongation).
+        # m_at_lip: cone-scaled module at z_lip; ra_r/rf_r: ring tooth inner tip/root there.
+        retention   = props.gear_retention
+        tolerance   = props.gear_tolerance
+        z_lip       = ext
+        m_at_lip    = m * (full_h + z_lip) / full_h
+        ra_r        = (T_ring / 2.0 - 0.75) * m_at_lip
+        rf_r        = (T_ring / 2.0 + 1.25) * m_at_lip   # = cone_r_at_lip - wall
+        z_high      = z_lip + gw                           # safely above cone mouth
+
+        if retention:
+            tan_phi = math.tan(phi)
+            # Ring lip triangle (in r-z, revolved around Z):
+            #   A: ring inner tooth tip at z_lip
+            #   Line 1: at phi angle outward (= planet top face slope) to just past rf_r
+            #   Line 2: same length, inward+down at beta (cone wall = ring bevel angle)
+            #   Line 3: closes C back to A — this is also the planet chamfer angle
+            dr_1  = (rf_r - ra_r) + tolerance           # radial extent of Line 1
+            d_1   = dr_1 / math.cos(phi)                # Line 1 length along phi slope
+            A_lip = (ra_r,                      z_lip)
+            B_lip = (ra_r + d_1*math.cos(phi),  z_lip - d_1*math.sin(phi))
+            C_lip = (B_lip[0] - d_1*math.sin(beta), B_lip[1] - d_1*math.cos(beta))
+
+            # ── Boolean 3: Trim cone mouth (DIFFERENCE) ──
+            # Removes outer rim above phi-slope from ra_r outward.
+            r_far        = cone_r * 1.5
+            trim_profile = [
+                (ra_r,  z_lip),
+                (r_far, z_lip - (r_far - ra_r) * tan_phi),
+                (r_far, z_high),
+                (ra_r,  z_high),
+            ]
+            trim_obj = _make_revolution_solid("TRIM_Ring", trim_profile)
+            mod_tr   = cone_obj.modifiers.new("TrimTop", 'BOOLEAN')
+            mod_tr.operation = 'DIFFERENCE'
+            mod_tr.object    = trim_obj
+            mod_tr.solver    = 'EXACT'
+            with context.temp_override(active_object=cone_obj):
+                bpy.ops.object.modifier_apply(modifier="TrimTop")
+            bpy.data.objects.remove(trim_obj, do_unlink=True)
+
+            # ── Boolean 4: Ring lip UNION ──
+            # Adds retaining overhang at top of ring gear groove.
+            lip_obj  = _make_revolution_solid("RING_Lip", [A_lip, B_lip, C_lip])
+            mod_rl   = cone_obj.modifiers.new("RingLip", 'BOOLEAN')
+            mod_rl.operation = 'UNION'
+            mod_rl.object    = lip_obj
+            mod_rl.solver    = 'FLOAT'
+            with context.temp_override(active_object=cone_obj):
+                bpy.ops.object.modifier_apply(modifier="RingLip")
+            bpy.data.objects.remove(lip_obj, do_unlink=True)
+
+            # Precompute planet chamfer cutter (Line 3 of ring lip, offset by tolerance).
+            # Normal perpendicular to Line 3 pointing "below" (into planet body):
+            # rotate L3 direction (C→A) by 90° CCW in r-z.
+            l3_dr  = A_lip[0] - C_lip[0]   # negative (A has smaller r)
+            l3_dz  = A_lip[1] - C_lip[1]   # positive (A has larger z)
+            l3_len = math.sqrt(l3_dr**2 + l3_dz**2)
+            nt_r   = -l3_dz / l3_len        # normal toward "below" Line 3, r component
+            nt_z   =  l3_dr / l3_len        # normal toward "below" Line 3, z component
+            A_tol  = (A_lip[0] + nt_r * tolerance, A_lip[1] + nt_z * tolerance)
+            C_tol  = (C_lip[0] + nt_r * tolerance, C_lip[1] + nt_z * tolerance)
+            r_outer = rf_r + 2.0 * m_at_lip  # past outer planet tip
+            chamfer_profile = [
+                A_tol,
+                (A_tol[0], z_high),
+                (r_outer,  z_high),
+                (r_outer,  C_tol[1]),
+                C_tol,
+            ]
+
         # Extension: world-Z increment ext → correct local-Z per gear axis direction.
         # Planet tilted at phi: ext world-Z = ext/cos(phi) local-Z.
         # Sun vertical: ext world-Z = ext local-Z.
@@ -469,14 +573,34 @@ class PLANETS_OT_generate(bpy.types.Operator):
 
         # 3. Sun gear — raised by sun_raise*gw; top=m_top_sun, bottom=m_bot_sun.
         pts_ext_sun = _spur_pts(T_sun, m_ext_sun, clearance) if ext > 0.0 else None
-        _make_bevel_gear("SunGear",
+        sun_obj = _make_bevel_gear("SunGear",
             _spur_pts(T_sun, m_top_sun, clearance),
             _spur_pts(T_sun, m_bot_sun, clearance),
             gw, (0.9, 0.78, 0.05, 1.0), Vector((0.0, 0.0, z_disk_sun)),
             pts_ext=pts_ext_sun, ext_local=ext_local_sun)
 
+        if retention:
+            # ── Boolean 5: Sun lip UNION ──
+            # Triangle: A at (ra_r, z_lip), Line 1 horizontal inward to just past sun root,
+            # Line 2 same length inward+down at sun bevel angle, Line 3 closes back to A.
+            rf_sun_lip = (T_sun / 2.0 - 1.25) * gear_scale * m_at_lip
+            dr_sun     = (ra_r - rf_sun_lip) + tolerance
+            A_sun = (ra_r,            z_lip)
+            B_sun = (ra_r - dr_sun,   z_lip)
+            C_sun = (B_sun[0] - dr_sun * math.sin(_sun_bevel),
+                     B_sun[1] - dr_sun * math.cos(_sun_bevel))
+            sun_lip_obj  = _make_revolution_solid("SUN_Lip", [A_sun, B_sun, C_sun])
+            mod_sl       = sun_obj.modifiers.new("SunLip", 'BOOLEAN')
+            mod_sl.operation = 'UNION'
+            mod_sl.object    = sun_lip_obj
+            mod_sl.solver    = 'FLOAT'
+            with context.temp_override(active_object=sun_obj):
+                bpy.ops.object.modifier_apply(modifier="SunLip")
+            bpy.data.objects.remove(sun_lip_obj, do_unlink=True)
+
         # 4. Planet gears — placed on apex bevel line at z_disk, tilted so axis
         #    points at cone apex → bevel face is parallel to the ring gear bevel.
+        planet_objs = []
         for i in range(n_pl):
             pts_ext_pl = (_rotate_pts(_spur_pts(T_planet, m_ext_planet, clearance), th_pl[i])
                           if ext > 0.0 else None)
@@ -492,6 +616,21 @@ class PLANETS_OT_generate(bpy.types.Operator):
             pl_obj.rotation_mode = 'QUATERNION'
             pl_obj.rotation_quaternion = rest_q
             pl_obj['rest_q'] = list(rest_q)
+            planet_objs.append(pl_obj)
+
+        if retention:
+            # ── Boolean 6: Planet chamfer DIFFERENCE ──
+            # Chamfer cone = Line 3 (offset by tolerance) revolved around Z.
+            # Applied to each planet; axisymmetric cutter wraps around the tilted gear.
+            for pl_obj in planet_objs:
+                ch_obj = _make_revolution_solid("CHAMFER_Pl", chamfer_profile)
+                mod_ch = pl_obj.modifiers.new("Chamfer", 'BOOLEAN')
+                mod_ch.operation = 'DIFFERENCE'
+                mod_ch.object    = ch_obj
+                mod_ch.solver    = 'EXACT'
+                with context.temp_override(active_object=pl_obj):
+                    bpy.ops.object.modifier_apply(modifier="Chamfer")
+                bpy.data.objects.remove(ch_obj, do_unlink=True)
 
         spacing_ok = (T_sun + T_ring) % n_pl == 0
         self.report({'INFO'},
@@ -777,6 +916,14 @@ class PLANETS_PT_main(bpy.types.Panel):
         row2.alert = not spacing_ok
         row2.label(text="n_planets: OK" if spacing_ok else
                    f"n_planets={props.n_planets} invalid -- pick a button above")
+
+        # -- Retention --
+        box = layout.box()
+        box.label(text="Retention System")
+        box.prop(props, "gear_retention")
+        col = box.column(align=True)
+        col.enabled = props.gear_retention
+        col.prop(props, "gear_tolerance")
 
         # -- Action buttons --
         layout.separator()
