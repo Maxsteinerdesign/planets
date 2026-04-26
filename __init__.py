@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 32),
+    "version":     (0, 5, 33),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -448,7 +448,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
                             (cone_r * (full_h + ring_void_bot) / full_h - wall)
                             / (T_ring / 2.0 + 1.25))
 
-        print(f"Planets v0.5.32 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
+        print(f"Planets v0.5.33 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
         print(f"  phi={math.degrees(phi):.1f}° hub_r={hub_r:.2f} hub_top={hub_top:.2f}")
         print(f"  z_outer={z_outer:.2f} z_ring_bot={z_ring_bot:.2f} ring_void_bot={ring_void_bot:.2f}")
         print(f"  ra_fill={ra_fill:.2f} ra_fill_bot={ra_fill_bot:.2f}")
@@ -484,35 +484,43 @@ class PLANETS_OT_generate(bpy.types.Operator):
         print(f"  fill UNION: verts {v_before}->{len(cone_obj.data.vertices)}")
 
         # ── Retention geometry ──
-        # All retention geometry lives at z_lip = ext (the cone mouth after elongation).
-        # m_at_lip: cone-scaled module at z_lip; ra_r/rf_r: ring tooth inner tip/root there.
+        # Point A = intersection of planet top face plane with ring inner cone surface.
+        # Planet top face (with elongation ext) in r-z:
+        #   z = center_z_ext - (r - center_r_ext)*tan(phi)
+        # Ring inner cone: r = ra0*(full_h+z)/full_h  where ra0=(T_ring/2-0.75)*m
+        # Solving simultaneously gives z_A and ra_r_A — the correct level for the lip.
         retention   = props.gear_retention
         tolerance   = props.gear_tolerance
-        z_lip       = ext
-        m_at_lip    = m * (full_h + z_lip) / full_h
-        ra_r        = (T_ring / 2.0 - 0.75) * m_at_lip
-        rf_r        = (T_ring / 2.0 + 1.25) * m_at_lip   # = cone_r_at_lip - wall
-        z_high      = z_lip + gw                           # safely above cone mouth
+        tan_phi     = math.tan(phi)
+        ext_local_top = gw / 2.0 + ext / math.cos(phi)   # local-Z to planet extension tip
+        center_r_ext  = orbit_r_planet + ext_local_top * math.sin(phi)
+        center_z_ext  = z_disk + ext_local_top * math.cos(phi)  # = gw/2*(cos(phi)-1) + ext
+        ra0   = (T_ring / 2.0 - 0.75) * m
+        k_lip = ra0 * tan_phi / full_h
+        z_A   = (center_z_ext + center_r_ext * tan_phi - k_lip * full_h) / (1.0 + k_lip)
+        ra_r  = ra0 * (full_h + z_A) / full_h             # ring inner tip at z_A
+        m_at_zA = m * (full_h + z_A) / full_h             # cone-scaled module at z_A
+        rf_r    = (T_ring / 2.0 + 1.25) * m_at_zA         # ring root at z_A
+        z_high  = ext + gw                                 # safely above cone mouth
 
         if retention:
-            tan_phi = math.tan(phi)
             # Ring lip triangle (in r-z, revolved around Z):
-            #   A: ring inner tooth tip at z_lip
+            #   A: ring inner tooth tip at z_A (on planet top face plane)
             #   Line 1: at phi angle outward (= planet top face slope) to just past rf_r
             #   Line 2: same length, inward+down at beta (cone wall = ring bevel angle)
             #   Line 3: closes C back to A — this is also the planet chamfer angle
             dr_1  = (rf_r - ra_r) + tolerance           # radial extent of Line 1
             d_1   = dr_1 / math.cos(phi)                # Line 1 length along phi slope
-            A_lip = (ra_r,                      z_lip)
-            B_lip = (ra_r + d_1*math.cos(phi),  z_lip - d_1*math.sin(phi))
+            A_lip = (ra_r,                      z_A)
+            B_lip = (ra_r + d_1*math.cos(phi),  z_A - d_1*math.sin(phi))
             C_lip = (B_lip[0] - d_1*math.sin(beta), B_lip[1] - d_1*math.cos(beta))
 
             # ── Boolean 3: Trim cone mouth (DIFFERENCE) ──
             # Removes outer rim above phi-slope from ra_r outward.
             r_far        = cone_r * 1.5
             trim_profile = [
-                (ra_r,  z_lip),
-                (r_far, z_lip - (r_far - ra_r) * tan_phi),
+                (ra_r,  z_A),
+                (r_far, z_A - (r_far - ra_r) * tan_phi),
                 (r_far, z_high),
                 (ra_r,  z_high),
             ]
@@ -546,7 +554,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
             nt_z   =  l3_dr / l3_len        # normal toward "below" Line 3, z component
             A_tol  = (A_lip[0] + nt_r * tolerance, A_lip[1] + nt_z * tolerance)
             C_tol  = (C_lip[0] + nt_r * tolerance, C_lip[1] + nt_z * tolerance)
-            r_outer = rf_r + 2.0 * m_at_lip  # past outer planet tip
+            r_outer = rf_r + 2.0 * m_at_zA   # past outer planet tip
             chamfer_profile = [
                 A_tol,
                 (A_tol[0], z_high),
@@ -583,10 +591,10 @@ class PLANETS_OT_generate(bpy.types.Operator):
             # ── Boolean 5: Sun lip UNION ──
             # Triangle: A at (ra_r, z_lip), Line 1 horizontal inward to just past sun root,
             # Line 2 same length inward+down at sun bevel angle, Line 3 closes back to A.
-            rf_sun_lip = (T_sun / 2.0 - 1.25) * gear_scale * m_at_lip
+            rf_sun_lip = (T_sun / 2.0 - 1.25) * gear_scale * m_at_zA
             dr_sun     = (ra_r - rf_sun_lip) + tolerance
-            A_sun = (ra_r,            z_lip)
-            B_sun = (ra_r - dr_sun,   z_lip)
+            A_sun = (ra_r,            z_A)
+            B_sun = (ra_r - dr_sun,   z_A)
             C_sun = (B_sun[0] - dr_sun * math.sin(_sun_bevel),
                      B_sun[1] - dr_sun * math.cos(_sun_bevel))
             sun_lip_obj  = _make_revolution_solid("SUN_Lip", [A_sun, B_sun, C_sun])
