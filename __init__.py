@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 33),
+    "version":     (0, 5, 83),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -208,6 +208,7 @@ def _make_inner_fill(name, hub_r, hub_top, ring_r_top, ring_r_bot, z_bot,
                 for j in range(segments):
                     k = (j + 1) % segments
                     bm.faces.new([r0[j], r1[j], r1[k], r0[k]])
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     mesh = bpy.data.meshes.new(name + "_Mesh")
     bm.to_mesh(mesh)
     bm.free()
@@ -356,6 +357,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
         T_planet  = props.T_planet
         T_ring    = T_sun + 2 * T_planet
         clearance = props.tooth_clearance
+        tolerance = props.gear_tolerance
         ext       = props.gear_elongation
 
         r_bottom = cone_r / 4.0
@@ -448,7 +450,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
                             (cone_r * (full_h + ring_void_bot) / full_h - wall)
                             / (T_ring / 2.0 + 1.25))
 
-        print(f"Planets v0.5.33 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
+        print(f"Planets v0.5.52 generate: gw={gw} m={m:.3f} gear_scale={gear_scale:.4f} m_top_planet={m_top_planet:.3f} m_bot_planet={m_bot_planet:.3f} T_ring={T_ring}")
         print(f"  phi={math.degrees(phi):.1f}° hub_r={hub_r:.2f} hub_top={hub_top:.2f}")
         print(f"  z_outer={z_outer:.2f} z_ring_bot={z_ring_bot:.2f} ring_void_bot={ring_void_bot:.2f}")
         print(f"  ra_fill={ra_fill:.2f} ra_fill_bot={ra_fill_bot:.2f}")
@@ -471,17 +473,28 @@ class PLANETS_OT_generate(bpy.types.Operator):
         # ── Boolean 2: Fill UNION ──
         # Adds hub+slope solid back. Fill bottom is buried in solid cone — no artifact.
         v_before = len(cone_obj.data.vertices)
-        fill_obj  = _make_inner_fill("FILL_Base", hub_r, hub_top,
+        fill_obj  = _make_inner_fill("FILL_Base", hub_r, hub_top - tolerance,
                                      ra_fill, ra_fill_bot,
                                      z_fill_bot, z_top=z_outer)
         mod_fill           = cone_obj.modifiers.new("FillAdd", 'BOOLEAN')
         mod_fill.operation = 'UNION'
         mod_fill.object    = fill_obj
-        mod_fill.solver    = 'FLOAT'
+        mod_fill.solver    = 'EXACT'
         with context.temp_override(active_object=cone_obj):
             bpy.ops.object.modifier_apply(modifier="FillAdd")
         bpy.data.objects.remove(fill_obj, do_unlink=True)
         print(f"  fill UNION: verts {v_before}->{len(cone_obj.data.vertices)}")
+
+        # Extension: world-Z increment ext → correct local-Z per gear axis direction.
+        # Planet tilted at phi: ext world-Z = ext/cos(phi) local-Z.
+        if ext > 0.0:
+            ext_local_pl   = ext / math.cos(phi)
+            cone_scale_ext = (full_h + ext) / full_h
+            m_ext_planet   = m_top_planet * cone_scale_ext
+        else:
+            ext_local_pl = 0.0
+            m_ext_planet = m_top_planet
+        ra_ext_planet = (T_planet / 2.0 + 1.0) * m_ext_planet
 
         # ── Retention geometry ──
         # Point A = intersection of planet top face plane with ring inner cone surface.
@@ -490,7 +503,6 @@ class PLANETS_OT_generate(bpy.types.Operator):
         # Ring inner cone: r = ra0*(full_h+z)/full_h  where ra0=(T_ring/2-0.75)*m
         # Solving simultaneously gives z_A and ra_r_A — the correct level for the lip.
         retention   = props.gear_retention
-        tolerance   = props.gear_tolerance
         tan_phi     = math.tan(phi)
         ext_local_top = gw / 2.0 + ext / math.cos(phi)   # local-Z to planet extension tip
         center_r_ext  = orbit_r_planet + ext_local_top * math.sin(phi)
@@ -515,14 +527,31 @@ class PLANETS_OT_generate(bpy.types.Operator):
             B_lip = (ra_r + d_1*math.cos(phi),  z_A - d_1*math.sin(phi))
             C_lip = (B_lip[0] - d_1*math.sin(beta), B_lip[1] - d_1*math.cos(beta))
 
-            # ── Boolean 3: Trim cone mouth (DIFFERENCE) ──
-            # Removes outer rim above phi-slope from ra_r outward.
+            # ── Boolean 3: Ring lip UNION ──
+            # Adds retaining overhang into the hollow ring groove.
+            # Done BEFORE trim so the lip top face (Line 1, phi-slope) is buried inside
+            # the ring body — no coplanar face conflict with the trim cut surface.
+            lip_obj  = _make_revolution_solid("RING_Lip", [A_lip, B_lip, C_lip])
+            mod_rl   = cone_obj.modifiers.new("RingLip", 'BOOLEAN')
+            mod_rl.operation = 'UNION'
+            mod_rl.object    = lip_obj
+            mod_rl.solver    = 'EXACT'
+            with context.temp_override(active_object=cone_obj):
+                bpy.ops.object.modifier_apply(modifier="RingLip")
+            bpy.data.objects.remove(lip_obj, do_unlink=True)
+
+            # ── Boolean 4: Trim cone mouth (DIFFERENCE) ──
+            # Removes outer rim above phi-slope.
+            # Inner boundary set one module INWARD of ra_r so the trim's bottom-inner
+            # corner is not coincident with lip vertex A — eliminates per-tooth artifacts.
             r_far        = cone_r * 1.5
+            r_trim_in    = ra_r - m_at_zA                        # one module inward of tip circle
+            z_trim_in    = z_A + m_at_zA * tan_phi               # phi-slope height at r_trim_in
             trim_profile = [
-                (ra_r,  z_A),
-                (r_far, z_A - (r_far - ra_r) * tan_phi),
-                (r_far, z_high),
-                (ra_r,  z_high),
+                (r_trim_in, z_trim_in),
+                (r_far,     z_A - (r_far - ra_r) * tan_phi),
+                (r_far,     z_high),
+                (r_trim_in, z_high),
             ]
             trim_obj = _make_revolution_solid("TRIM_Ring", trim_profile)
             mod_tr   = cone_obj.modifiers.new("TrimTop", 'BOOLEAN')
@@ -533,54 +562,73 @@ class PLANETS_OT_generate(bpy.types.Operator):
                 bpy.ops.object.modifier_apply(modifier="TrimTop")
             bpy.data.objects.remove(trim_obj, do_unlink=True)
 
-            # ── Boolean 4: Ring lip UNION ──
-            # Adds retaining overhang at top of ring gear groove.
-            lip_obj  = _make_revolution_solid("RING_Lip", [A_lip, B_lip, C_lip])
-            mod_rl   = cone_obj.modifiers.new("RingLip", 'BOOLEAN')
-            mod_rl.operation = 'UNION'
-            mod_rl.object    = lip_obj
-            mod_rl.solver    = 'FLOAT'
-            with context.temp_override(active_object=cone_obj):
-                bpy.ops.object.modifier_apply(modifier="RingLip")
-            bpy.data.objects.remove(lip_obj, do_unlink=True)
-
-            # Precompute planet chamfer cutter (Line 3 of ring lip, offset by tolerance).
-            # Normal perpendicular to Line 3 pointing "below" (into planet body):
-            # rotate L3 direction (C→A) by 90° CCW in r-z.
-            l3_dr  = A_lip[0] - C_lip[0]   # negative (A has smaller r)
-            l3_dz  = A_lip[1] - C_lip[1]   # positive (A has larger z)
+            # Precompute planet chamfer cutter.
+            # The same ring-lip triangle (A, B, C), tolerance-offset along Line 3's normal,
+            # will be revolved around each planet's LOCAL Z-axis (not the sun axis).
+            # Step 1: compute tolerance-offset points in world r-z.
+            l3_dr  = A_lip[0] - C_lip[0]
+            l3_dz  = A_lip[1] - C_lip[1]
             l3_len = math.sqrt(l3_dr**2 + l3_dz**2)
-            nt_r   = -l3_dz / l3_len        # normal toward "below" Line 3, r component
-            nt_z   =  l3_dr / l3_len        # normal toward "below" Line 3, z component
+            nt_r   = -l3_dz / l3_len
+            nt_z   =  l3_dr / l3_len
             A_tol  = (A_lip[0] + nt_r * tolerance, A_lip[1] + nt_z * tolerance)
             C_tol  = (C_lip[0] + nt_r * tolerance, C_lip[1] + nt_z * tolerance)
-            r_outer = rf_r + 2.0 * m_at_zA   # past outer planet tip
-            chamfer_profile = [
-                A_tol,
-                (A_tol[0], z_high),
-                (r_outer,  z_high),
-                (r_outer,  C_tol[1]),
-                C_tol,
+            # Step 2: transform world r-z → planet local r-z.
+            # Planet object origin at (orbit_r_planet, z_disk) in world r-z.
+            # Local Z = (sin_phi, cos_phi), local R = (cos_phi, -sin_phi) in world r-z.
+            sin_phi = math.sin(phi)
+            cos_phi = math.cos(phi)
+            def _w2l(rw, zw):
+                dr = rw - orbit_r_planet;  dz = zw - z_disk
+                return (dr * cos_phi - dz * sin_phi,   # local r (distance from planet axis)
+                        dr * sin_phi + dz * cos_phi)   # local z (along planet axis)
+            # Cutter must extend outward AND above the planet tip face.
+            # Extend the A→C chamfer slope as a straight line past local_A_tol to
+            # lz_top (one module above the tip face) — smooth cut with no kink.
+            _cone_scale_ch = (full_h + ext) / full_h if ext > 0.0 else 1.0
+            lr_outer    = (T_planet / 2.0 + 2.0) * m_top_planet * _cone_scale_ch
+            local_A_tol = _w2l(*A_tol)
+            local_C_tol = _w2l(*C_tol)
+            lz_top      = local_A_tol[1] + m_top_planet
+            t_ext       = (lz_top - local_C_tol[1]) / (local_A_tol[1] - local_C_tol[1])
+            r_A_ext     = local_C_tol[0] + t_ext * (local_A_tol[0] - local_C_tol[0])
+            chamfer_local = [
+                (r_A_ext,  lz_top),           # A extended up chamfer slope, above tip face
+                (lr_outer, lz_top),           # outer, above tip face
+                (lr_outer, local_C_tol[1]),   # outer bottom
+                local_C_tol,                  # inner bottom
             ]
 
-        # Extension: world-Z increment ext → correct local-Z per gear axis direction.
-        # Planet tilted at phi: ext world-Z = ext/cos(phi) local-Z.
-        # Sun vertical: ext world-Z = ext local-Z.
-        # Tip profile is cone-scaled at z=+ext so ring and planet stay parallel throughout.
-        # (cone-scaled: m_ext = m_top * (full_h + ext) / full_h, same ratio as ring groove)
-        if ext > 0.0:
-            ext_local_pl  = ext / math.cos(phi)
-            ext_local_sun = ext
-            cone_scale_ext = (full_h + ext) / full_h
-            m_ext_planet   = m_top_planet * cone_scale_ext
-            m_ext_sun      = m_top_sun    * cone_scale_ext
+        if retention:
+            # After chamfer, the highest world-z on the sun-facing side is at r_boundary:
+            # the point on the chamfer slope (in planet local r) where z_slope = local_tip_z.
+            # That edge is the visible outer corner of the chamfer bevel.
+            local_tip_z = gw / 2.0 + ext_local_pl
+            frac        = (local_tip_z - local_C_tol[1]) / (lz_top - local_C_tol[1])
+            r_boundary  = local_C_tol[0] + frac * (r_A_ext - local_C_tol[0])
+            z_planet_max     = z_disk + r_boundary * sin_phi + local_tip_z * cos_phi
+            # World-r of the planet's inner chamfer boundary at z_planet_max —
+            # sun tip radius must stay inside this to avoid tooth penetration.
+            r_chamfer_at_max = orbit_r_planet - r_boundary * cos_phi + local_tip_z * sin_phi
         else:
-            ext_local_pl = ext_local_sun = 0.0
-            m_ext_planet = m_top_planet
-            m_ext_sun    = m_top_sun
+            z_planet_max = (z_disk
+                            + ra_ext_planet * math.sin(phi)
+                            + (gw / 2.0 + ext_local_pl) * math.cos(phi))
+        # Sun tip: when retention is on, extend to z_planet_max so the sun's top surface
+        # equals the planet's highest world-z and the lip starts at that surface.
+        if retention:
+            ext_local_sun   = max(0.0, z_planet_max - (z_disk_sun + gw / 2.0))
+            m_ext_sun       = m_top_sun * (full_h + z_planet_max) / full_h
+            # Cap tooth addendum so sun tip circle stays inside planet chamfer boundary.
+            m_ext_sun_teeth = min(m_ext_sun,
+                                  (r_chamfer_at_max - tolerance) / (T_sun / 2.0 + 1.0))
+        else:
+            ext_local_sun   = ext if ext > 0.0 else 0.0
+            m_ext_sun       = m_top_sun * (full_h + ext) / full_h if ext > 0.0 else m_top_sun
+            m_ext_sun_teeth = m_ext_sun
 
         # 3. Sun gear — raised by sun_raise*gw; top=m_top_sun, bottom=m_bot_sun.
-        pts_ext_sun = _spur_pts(T_sun, m_ext_sun, clearance) if ext > 0.0 else None
+        pts_ext_sun = _spur_pts(T_sun, m_ext_sun_teeth, clearance) if ext_local_sun > 0.0 else None
         sun_obj = _make_bevel_gear("SunGear",
             _spur_pts(T_sun, m_top_sun, clearance),
             _spur_pts(T_sun, m_bot_sun, clearance),
@@ -589,22 +637,36 @@ class PLANETS_OT_generate(bpy.types.Operator):
 
         if retention:
             # ── Boolean 5: Sun lip UNION ──
-            # Triangle: A at (ra_r, z_lip), Line 1 horizontal inward to just past sun root,
-            # Line 2 same length inward+down at sun bevel angle, Line 3 closes back to A.
-            rf_sun_lip = (T_sun / 2.0 - 1.25) * gear_scale * m_at_zA
-            dr_sun     = (ra_r - rf_sun_lip) + tolerance
-            A_sun = (ra_r,            z_A)
-            B_sun = (ra_r - dr_sun,   z_A)
-            C_sun = (B_sun[0] - dr_sun * math.sin(_sun_bevel),
-                     B_sun[1] - dr_sun * math.cos(_sun_bevel))
-            sun_lip_obj  = _make_revolution_solid("SUN_Lip", [A_sun, B_sun, C_sun])
-            mod_sl       = sun_obj.modifiers.new("SunLip", 'BOOLEAN')
-            mod_sl.operation = 'UNION'
-            mod_sl.object    = sun_lip_obj
-            mod_sl.solver    = 'FLOAT'
-            with context.temp_override(active_object=sun_obj):
-                bpy.ops.object.modifier_apply(modifier="SunLip")
-            bpy.data.objects.remove(sun_lip_obj, do_unlink=True)
+            # A: outer tooth tip at z_planet_max.  B: inward to root (same z, line 1).
+            # C: from A along the sun-facing chamfer direction (parallel to chamfer cutter slope).
+            # Clamp ra_sun_top so A stays inside the chamfer void (≤ r_chamfer_at_max).
+            # Clamp lip_len so C stays within chamfer length (≤ len_s − tolerance).
+            # Uses tooth profiles (not revolution solid) so the UNION only adds material at
+            # tooth peaks — a revolution solid would fill sun tooth gaps, creating intersections
+            # with planet teeth at positions where the sun has a gap.
+            dr_loc  = r_A_ext     - local_C_tol[0]
+            dz_loc  = lz_top      - local_C_tol[1]
+            slope_r =  dr_loc * cos_phi - dz_loc * sin_phi
+            slope_z = -(dr_loc * sin_phi + dz_loc * cos_phi)
+            len_s   = math.sqrt(slope_r**2 + slope_z**2)
+            ra_sun_top = min((T_sun / 2.0 + 1.0) * m_ext_sun, r_chamfer_at_max - tolerance)
+            rf_sun     = (T_sun / 2.0 - 1.25) * m_ext_sun
+            lip_len    = min(ra_sun_top - rf_sun, len_s - tolerance)
+            if lip_len > 0:
+                z_C_sun  = z_planet_max + lip_len * slope_z / len_s
+                ra_C_sun = ra_sun_top   + lip_len * slope_r / len_s
+                pts_sun_z0 = _spur_pts(T_sun, ra_sun_top / (T_sun / 2.0 + 1.0), clearance)
+                pts_sun_zC = _spur_pts(T_sun, ra_C_sun   / (T_sun / 2.0 + 1.0), clearance)
+                sun_lip_obj = _connect_profiles("SUN_Lip",
+                                                pts_sun_z0, pts_sun_zC,
+                                                z_planet_max, z_C_sun)
+                mod_sl       = sun_obj.modifiers.new("SunLip", 'BOOLEAN')
+                mod_sl.operation = 'UNION'
+                mod_sl.object    = sun_lip_obj
+                mod_sl.solver    = 'EXACT'
+                with context.temp_override(active_object=sun_obj):
+                    bpy.ops.object.modifier_apply(modifier="SunLip")
+                bpy.data.objects.remove(sun_lip_obj, do_unlink=True)
 
         # 4. Planet gears — placed on apex bevel line at z_disk, tilted so axis
         #    points at cone apex → bevel face is parallel to the ring gear bevel.
@@ -628,10 +690,17 @@ class PLANETS_OT_generate(bpy.types.Operator):
 
         if retention:
             # ── Boolean 6: Planet chamfer DIFFERENCE ──
-            # Chamfer cone = Line 3 (offset by tolerance) revolved around Z.
-            # Applied to each planet; axisymmetric cutter wraps around the tilted gear.
-            for pl_obj in planet_objs:
-                ch_obj = _make_revolution_solid("CHAMFER_Pl", chamfer_profile)
+            # Ring lip triangle (tolerance-offset, in planet local r-z) revolved around
+            # each planet's LOCAL Z-axis.  Cutter is created around world Z, then rotated
+            # and translated to match each planet's position and tilt before the boolean.
+            for i, pl_obj in enumerate(planet_objs):
+                ch_obj = _make_revolution_solid("CHAMFER_Pl", chamfer_local)
+                ch_obj.rotation_mode = 'QUATERNION'
+                ch_obj.rotation_quaternion = Quaternion(
+                    Vector((-math.sin(alphas[i]), math.cos(alphas[i]), 0.0)), phi)
+                ch_obj.location = Vector((orbit_r_planet * math.cos(alphas[i]),
+                                          orbit_r_planet * math.sin(alphas[i]), z_disk))
+                bpy.context.view_layer.update()
                 mod_ch = pl_obj.modifiers.new("Chamfer", 'BOOLEAN')
                 mod_ch.operation = 'DIFFERENCE'
                 mod_ch.object    = ch_obj
