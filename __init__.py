@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 83),
+    "version":     (0, 5, 84),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -646,8 +646,8 @@ class PLANETS_OT_generate(bpy.types.Operator):
             # with planet teeth at positions where the sun has a gap.
             dr_loc  = r_A_ext     - local_C_tol[0]
             dz_loc  = lz_top      - local_C_tol[1]
-            slope_r =  dr_loc * cos_phi - dz_loc * sin_phi
-            slope_z = -(dr_loc * sin_phi + dz_loc * cos_phi)
+            slope_r = dr_loc * cos_phi + dz_loc * sin_phi
+            slope_z = -dr_loc * sin_phi + dz_loc * cos_phi
             len_s   = math.sqrt(slope_r**2 + slope_z**2)
             ra_sun_top = min((T_sun / 2.0 + 1.0) * m_ext_sun, r_chamfer_at_max - tolerance)
             rf_sun     = (T_sun / 2.0 - 1.25) * m_ext_sun
