@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 84),
+    "version":     (0, 5, 93),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -614,18 +614,14 @@ class PLANETS_OT_generate(bpy.types.Operator):
             z_planet_max = (z_disk
                             + ra_ext_planet * math.sin(phi)
                             + (gw / 2.0 + ext_local_pl) * math.cos(phi))
-        # Sun tip: when retention is on, extend to z_planet_max so the sun's top surface
-        # equals the planet's highest world-z and the lip starts at that surface.
         if retention:
             ext_local_sun   = max(0.0, z_planet_max - (z_disk_sun + gw / 2.0))
-            m_ext_sun       = m_top_sun * (full_h + z_planet_max) / full_h
-            # Cap tooth addendum so sun tip circle stays inside planet chamfer boundary.
-            m_ext_sun_teeth = min(m_ext_sun,
-                                  (r_chamfer_at_max - tolerance) / (T_sun / 2.0 + 1.0))
+            m_ext_sun       = m_top_sun * (full_h + ext_local_sun) / full_h if ext_local_sun > 0.0 else m_top_sun
         else:
             ext_local_sun   = ext if ext > 0.0 else 0.0
             m_ext_sun       = m_top_sun * (full_h + ext) / full_h if ext > 0.0 else m_top_sun
-            m_ext_sun_teeth = m_ext_sun
+        m_ext_sun_teeth = (min(m_ext_sun, (r_chamfer_at_max - tolerance) / (T_sun / 2.0 + 1.0))
+                           if retention else m_ext_sun)
 
         # 3. Sun gear — raised by sun_raise*gw; top=m_top_sun, bottom=m_bot_sun.
         pts_ext_sun = _spur_pts(T_sun, m_ext_sun_teeth, clearance) if ext_local_sun > 0.0 else None
@@ -636,37 +632,46 @@ class PLANETS_OT_generate(bpy.types.Operator):
             pts_ext=pts_ext_sun, ext_local=ext_local_sun)
 
         if retention:
-            # ── Boolean 5: Sun lip UNION ──
-            # A: outer tooth tip at z_planet_max.  B: inward to root (same z, line 1).
-            # C: from A along the sun-facing chamfer direction (parallel to chamfer cutter slope).
-            # Clamp ra_sun_top so A stays inside the chamfer void (≤ r_chamfer_at_max).
-            # Clamp lip_len so C stays within chamfer length (≤ len_s − tolerance).
-            # Uses tooth profiles (not revolution solid) so the UNION only adds material at
-            # tooth peaks — a revolution solid would fill sun tooth gaps, creating intersections
-            # with planet teeth at positions where the sun has a gap.
-            dr_loc  = r_A_ext     - local_C_tol[0]
-            dz_loc  = lz_top      - local_C_tol[1]
-            slope_r = dr_loc * cos_phi + dz_loc * sin_phi
-            slope_z = -dr_loc * sin_phi + dz_loc * cos_phi
-            len_s   = math.sqrt(slope_r**2 + slope_z**2)
-            ra_sun_top = min((T_sun / 2.0 + 1.0) * m_ext_sun, r_chamfer_at_max - tolerance)
-            rf_sun     = (T_sun / 2.0 - 1.25) * m_ext_sun
-            lip_len    = min(ra_sun_top - rf_sun, len_s - tolerance)
-            if lip_len > 0:
-                z_C_sun  = z_planet_max + lip_len * slope_z / len_s
-                ra_C_sun = ra_sun_top   + lip_len * slope_r / len_s
-                pts_sun_z0 = _spur_pts(T_sun, ra_sun_top / (T_sun / 2.0 + 1.0), clearance)
-                pts_sun_zC = _spur_pts(T_sun, ra_C_sun   / (T_sun / 2.0 + 1.0), clearance)
-                sun_lip_obj = _connect_profiles("SUN_Lip",
-                                                pts_sun_z0, pts_sun_zC,
-                                                z_planet_max, z_C_sun)
-                mod_sl       = sun_obj.modifiers.new("SunLip", 'BOOLEAN')
-                mod_sl.operation = 'UNION'
-                mod_sl.object    = sun_lip_obj
-                mod_sl.solver    = 'EXACT'
-                with context.temp_override(active_object=sun_obj):
-                    bpy.ops.object.modifier_apply(modifier="SunLip")
-                bpy.data.objects.remove(sun_lip_obj, do_unlink=True)
+            # ── Boolean 5: Sun retention ring UNION ──
+            # Triangle ABC revolved around sun's Z-axis, UNIONed into sun gear.
+            # A = (ra_sun_ext, z_planet_max)  — tip circle at top of sun extension
+            # B = (rf_sun_ext, z_planet_max)  — root circle at same height (Line 1: A→B horizontal)
+            # Line 2: from B downward, parallel to sun bevel cone surface
+            # Line 3: from A downward AND inward toward sun axis, parallel to planet chamfer
+            # C = intersection of Line 2 and Line 3
+            ra_sun_ext = (T_sun / 2.0 + 1.0) * m_ext_sun_teeth
+            rf_sun_ext = (T_sun / 2.0 - 1.25) * m_ext_sun_teeth
+            # Line 2: from B downward, parallel to sun bevel cone surface
+            z_apex_sun = (z_disk_sun + gw / 2.0
+                          - gw * m_top_sun / max(m_top_sun - m_bot_sun, 1e-9))
+            slope_r2   = ra_sun_ext / (z_planet_max - z_apex_sun)
+            # Line 3: parallel to planet chamfer face on the SUN-FACING side
+            # of the planet (cutter is revolved around planet local Z, so the
+            # cross-section has mirror copies at ±local_r; sun retention engages
+            # the −local_r mirror). Flip sign of delta_lr to switch sides.
+            delta_lr   = r_A_ext - local_C_tol[0]   # < 0 in local
+            delta_lz   = lz_top  - local_C_tol[1]   # > 0 in local
+            slope_line3 = ((-delta_lr * cos_phi + delta_lz * sin_phi)
+                           / (delta_lz * cos_phi + delta_lr * sin_phi))
+            dz_C       = (ra_sun_ext - rf_sun_ext) / (slope_line3 - slope_r2)
+            z_C        = z_planet_max - dz_C
+            r_C        = ra_sun_ext - slope_line3 * dz_C
+            print(f"  Sun ring: A=({ra_sun_ext:.3f},{z_planet_max:.3f}) "
+                  f"B=({rf_sun_ext:.3f},{z_planet_max:.3f}) C=({r_C:.3f},{z_C:.3f}) "
+                  f"slope_l3={slope_line3:.3f} slope_l2={slope_r2:.3f}")
+            sun_ring_profile = [
+                (ra_sun_ext, z_planet_max),
+                (rf_sun_ext, z_planet_max),
+                (r_C,        z_C),
+            ]
+            ring_obj = _make_revolution_solid("SunRing", sun_ring_profile)
+            mod_sr = sun_obj.modifiers.new("SunRing", 'BOOLEAN')
+            mod_sr.operation = 'UNION'
+            mod_sr.object    = ring_obj
+            mod_sr.solver    = 'EXACT'
+            with context.temp_override(active_object=sun_obj):
+                bpy.ops.object.modifier_apply(modifier="SunRing")
+            bpy.data.objects.remove(ring_obj, do_unlink=True)
 
         # 4. Planet gears — placed on apex bevel line at z_disk, tilted so axis
         #    points at cone apex → bevel face is parallel to the ring gear bevel.
