@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 93),
+    "version":     (0, 5, 95),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -38,7 +38,7 @@ class PlanetsProperties(bpy.types.PropertyGroup):
     n_planets       : IntProperty  (name="# Planets",       default=3,     min=2,     max=8)
     T_sun           : IntProperty  (name="Sun Teeth",       default=12,    min=6,     max=60)
     T_planet        : IntProperty  (name="Planet Teeth",    default=12,    min=6,     max=60)
-    tooth_clearance : FloatProperty(name="Tooth Clearance", default=0.05,  min=0.0,   max=0.30,
+    tooth_clearance : FloatProperty(name="Tooth Clearance", default=0.10,  min=0.0,   max=0.30,
                                     step=1,
                                     description="Angular fraction of pitch left as gap between meshing teeth")
     gear_elongation : FloatProperty(name="Gear Elongation", default=0.0,   min=0.0,   max=200.0,
@@ -323,6 +323,55 @@ def _ring_rotation(alpha0, theta_p0, T_planet, T_ring, m):
     rg_lin   = (lp / 2.0 - pl_lin) % lp
     rg_ang   = rg_lin / (T_ring * m / 2.0)
     return (alpha0 - rg_ang) % (2.0 * math.pi / T_ring)
+
+
+def _detect_overlaps(ctx, objs):
+    """Boolean-INTERSECT every pair; return [(name_a, name_b, n_faces, r, z), ...]
+    for each non-empty intersection.  Temporary intersection meshes are deleted."""
+    def _bbox(obj):
+        pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+        lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+        hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+        return lo, hi
+
+    def _bbox_overlap(a, b):
+        la, ha = _bbox(a); lb, hb = _bbox(b)
+        return (la.x <= hb.x and ha.x >= lb.x and
+                la.y <= hb.y and ha.y >= lb.y and
+                la.z <= hb.z and ha.z >= lb.z)
+
+    out = []
+    n = len(objs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = objs[i], objs[j]
+            if a is None or b is None or not _bbox_overlap(a, b):
+                continue
+            tmp = a.copy()
+            tmp.data = a.data.copy()
+            tmp.name = "__OvlpChk__"
+            ctx.scene.collection.objects.link(tmp)
+            mod = tmp.modifiers.new("OvlpCheck", 'BOOLEAN')
+            mod.operation = 'INTERSECT'
+            mod.object    = b
+            mod.solver    = 'EXACT'
+            try:
+                with ctx.temp_override(active_object=tmp):
+                    bpy.ops.object.modifier_apply(modifier="OvlpCheck")
+                if len(tmp.data.polygons) > 0:
+                    pts = [tmp.matrix_world @ v.co for v in tmp.data.vertices]
+                    np_ = len(pts)
+                    cx = sum(p.x for p in pts) / np_
+                    cy = sum(p.y for p in pts) / np_
+                    cz = sum(p.z for p in pts) / np_
+                    r  = (cx*cx + cy*cy) ** 0.5
+                    out.append((a.name, b.name, len(tmp.data.polygons), r, cz))
+            except Exception:
+                pass
+            data = tmp.data
+            bpy.data.objects.remove(tmp, do_unlink=True)
+            bpy.data.meshes.remove(data, do_unlink=True)
+    return out
 
 
 # ============================================================
@@ -714,9 +763,24 @@ class PLANETS_OT_generate(bpy.types.Operator):
                     bpy.ops.object.modifier_apply(modifier="Chamfer")
                 bpy.data.objects.remove(ch_obj, do_unlink=True)
 
+        # ── Final overlap check ──
+        # Boolean-INTERSECT every pair; report any with non-empty intersection.
+        overlaps = _detect_overlaps(context, [cone_obj, sun_obj] + planet_objs)
         spacing_ok = (T_sun + T_ring) % n_pl == 0
-        self.report({'INFO'},
-            f"T_ring={T_ring}  m={m:.3f}  wall={wall:.1f}  spacing={'OK' if spacing_ok else 'INVALID'}")
+        base_info = (f"T_ring={T_ring}  m={m:.3f}  wall={wall:.1f}  "
+                     f"spacing={'OK' if spacing_ok else 'INVALID'}")
+        if overlaps:
+            print(f"\n[Planets] {len(overlaps)} overlap(s) detected:")
+            for a, b, nf, r, z in overlaps:
+                print(f"  {a} <-> {b}: {nf} faces at r={r:.2f} z={z:.2f}")
+            pair_str = ", ".join(f"{a}/{b}@r={r:.1f},z={z:.1f}"
+                                 for a, b, _, r, z in overlaps[:3])
+            if len(overlaps) > 3:
+                pair_str += f", +{len(overlaps)-3} more"
+            self.report({'WARNING'},
+                f"{base_info}  |  {len(overlaps)} OVERLAP(s): {pair_str}  (see console)")
+        else:
+            self.report({'INFO'}, f"{base_info}  |  no overlaps")
         return {'FINISHED'}
 
 

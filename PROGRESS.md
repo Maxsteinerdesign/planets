@@ -5,17 +5,23 @@
 
 ---
 
-## ⭐ MILESTONE — v0.5.93 (2026-05-12)
+## ⭐ MILESTONE — v0.5.95 (2026-05-12)
 
-**Sun retention ring geometry confirmed correct.** Visual verification in Blender by Max:
-"It finally looks like it did before, when we just needed to make some small adjustments."
+**No-overlap assembly + automatic overlap warning.**
+- v0.5.94 bumped default `tooth_clearance` 0.05 → 0.10. Eliminates the small gear-tooth
+  interferences at the sun↔planet and ring↔planet meshing points (verified with
+  `show_intersections.py`: all 15 pairs report `ok` at defaults).
+- v0.5.95 adds an automatic post-generation overlap check inside `generate()`.
+  Boolean-INTERSECTs every pair of generated objects, surfaces any non-empty result as a
+  WARNING in the status bar with approximate (r, z) locations, full list to console.
 
-This commit is the known-good baseline. If future changes break retention, revert to the
-`v0.5.93-milestone` tag.
+Revert here with `git checkout v0.5.95-milestone -- __init__.py` if anything regresses.
+
+Previous milestone v0.5.93 is still tagged.
 
 ---
 
-## Current State (v0.5.93)
+## Current State (v0.5.95)
 
 **What works:**
 - All gear generation, ring, planet, sun
@@ -25,6 +31,9 @@ This commit is the known-good baseline. If future changes break retention, rever
 - `m_ext_sun_teeth` cap: prevents sun extension teeth from penetrating planet chamfer
 - Sun retention ring (Boolean UNION on sun_obj): triangle A-B-C revolved around sun Z, hooks
   over planet chamfer from inside
+- Default `tooth_clearance = 0.10` — gives ~12% backlash, no tooth interference at defaults
+- Automatic overlap check at end of `generate()`: reports any non-empty INTERSECT pair as a
+  WARNING with location, full detail to console
 
 **Sun retention ring approach (v0.5.93):**
 - Triangle A-B-C revolved around sun's Z-axis (`_make_revolution_solid`), UNION into sun gear
@@ -93,7 +102,9 @@ addon and reloading Blender.
 | v0.5.84 | v0.5.82 geometry + tooth profiles (_connect_profiles) | Untested at the time |
 | v0.5.91 | Triangle A-B-C revival, slope = tan_phi | Wrong angle |
 | v0.5.92 | Triangle A-B-C, slope from local→world transform | DOME (used ring-side slope) |
-| **v0.5.93** | **Flip sign of delta_lr → sun-side slope; add m_ext_sun_teeth cap** | **✓ CORRECT (milestone)** |
+| v0.5.93 | Flip sign of delta_lr → sun-side slope; add m_ext_sun_teeth cap | ✓ Retention correct (milestone) |
+| v0.5.94 | Default `tooth_clearance` 0.05 → 0.10 | No more gear-tooth interference at defaults |
+| **v0.5.95** | **Automatic overlap warning in `generate()`** | **✓ No overlaps + alert (milestone)** |
 
 ---
 
@@ -131,7 +142,8 @@ addon and reloading Blender.
 2. Check `git log --oneline` to confirm version
 3. Do NOT make structural changes without re-reading this file
 
-**To recover the v0.5.93 milestone if something breaks:**
+**To recover a milestone if something breaks:**
 ```
-git checkout v0.5.93-milestone -- __init__.py
+git checkout v0.5.95-milestone -- __init__.py    # latest known-good
+git checkout v0.5.93-milestone -- __init__.py    # earlier retention-only baseline
 ```
