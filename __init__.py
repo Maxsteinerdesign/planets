@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "Planets",
     "author":      "Max Steiner",
-    "version":     (0, 5, 95),
+    "version":     (0, 6, 0),
     "blender":     (5, 0, 0),
     "location":    "View3D > Sidebar > Planets",
     "description": "Planets -- planetary gear development sandbox",
@@ -23,6 +23,27 @@ PREFIX = "PL_"
 
 
 # ============================================================
+# Property update callbacks
+# ============================================================
+
+def _update_T_sun(self, context):
+    cone_r  = self.cone_diameter / 2.0
+    wall    = self.wall_thickness
+    entries = _valid_T_planet_entries(self.T_sun, cone_r, wall)
+    if not entries:
+        return
+    valid_map = {T_pl: vn for T_pl, vn in entries}
+    if self.T_planet not in valid_map:
+        T_pl, valid_n  = entries[0]
+        self.T_planet  = T_pl
+        self.n_planets = valid_n[0]
+    else:
+        valid_n = valid_map[self.T_planet]
+        if self.n_planets not in valid_n:
+            self.n_planets = valid_n[0]
+
+
+# ============================================================
 # Properties
 # ============================================================
 
@@ -31,18 +52,17 @@ class PlanetsProperties(bpy.types.PropertyGroup):
                                     description="Diameter at the wide/top opening of the cone (mm)")
     cone_height     : FloatProperty(name="Cone Height",     default=100.0, min=5.0,   max=1000.0,
                                     description="Height of the frustum (mouth to truncated bottom)")
-    gear_width      : FloatProperty(name="Gear Height",     default=20.0,  min=1.0,   max=200.0,
-                                    description="Height (thickness) of the planetary gear disk")
+    gear_width      : FloatProperty(name="Gear Height",      default=20.0,  min=1.0,   max=200.0,
+                                    description="Axial depth of the gear section — lowers the inner base and grows the gears to match")
     wall_thickness  : FloatProperty(name="Wall Thickness",  default=3.0,   min=3.0,   max=40.0,
                                     description="Gap from ring gear teeth tips to cone wall (mm)")
     n_planets       : IntProperty  (name="# Planets",       default=3,     min=2,     max=8)
-    T_sun           : IntProperty  (name="Sun Teeth",       default=12,    min=6,     max=60)
+    T_sun           : IntProperty  (name="Sun Teeth",       default=12,    min=6,     max=60,
+                                    update=_update_T_sun)
     T_planet        : IntProperty  (name="Planet Teeth",    default=12,    min=6,     max=60)
     tooth_clearance : FloatProperty(name="Tooth Clearance", default=0.10,  min=0.0,   max=0.30,
                                     step=1,
                                     description="Angular fraction of pitch left as gap between meshing teeth")
-    gear_elongation : FloatProperty(name="Gear Elongation", default=0.0,   min=0.0,   max=200.0,
-                                    description="Extends each gear outward beyond the gear zone (mm)")
     anim_speed      : FloatProperty(name="Speed (deg/frame)", default=2.0, min=0.1,   max=30.0)
     gear_retention  : BoolProperty (name="Retention System", default=False,
                                     description="Add ring lip, sun lip, and planet chamfer to retain gears when inverted")
@@ -407,7 +427,7 @@ class PLANETS_OT_generate(bpy.types.Operator):
         T_ring    = T_sun + 2 * T_planet
         clearance = props.tooth_clearance
         tolerance = props.gear_tolerance
-        ext       = props.gear_elongation
+        ext       = 0.0
 
         r_bottom = cone_r / 4.0
         z_bot    = -gw
@@ -937,10 +957,14 @@ class PLANETS_OT_animate(bpy.types.Operator):
 # UI helpers -- discrete tooth-count selection
 # ============================================================
 
-def _valid_T_planet_entries(T_sun, max_T=60):
+def _valid_T_planet_entries(T_sun, cone_r, wall, max_T=60):
     entries = []
     for T_pl in range(6, max_T + 1):
-        valid_n = [n for n in (3, 4, 5, 6) if (T_sun + T_pl) % n == 0]
+        T_ring = T_sun + 2 * T_pl
+        m      = max(0.001, (cone_r - wall) / (T_ring / 2.0 + 1.25))
+        max_n  = _max_n_planets_physical(T_sun, T_pl, m)
+        valid_n = [n for n in (3, 4, 5, 6)
+                   if (T_sun + T_pl) % n == 0 and n <= max_n]
         if valid_n:
             entries.append((T_pl, valid_n))
     return entries
@@ -965,7 +989,19 @@ class PLANETS_OT_set_T_planet(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
     value      : IntProperty()
     def execute(self, context):
-        context.scene.planets_props.T_planet = self.value
+        props          = context.scene.planets_props
+        props.T_planet = self.value
+        T_sun          = props.T_sun
+        T_pl           = self.value
+        cone_r         = props.cone_diameter / 2.0
+        wall           = props.wall_thickness
+        T_ring         = T_sun + 2 * T_pl
+        m              = max(0.001, (cone_r - wall) / (T_ring / 2.0 + 1.25))
+        max_n          = _max_n_planets_physical(T_sun, T_pl, m)
+        valid_n        = [n for n in (3, 4, 5, 6)
+                          if (T_sun + T_pl) % n == 0 and n <= max_n]
+        if valid_n and props.n_planets not in valid_n:
+            props.n_planets = valid_n[0]
         return {'FINISHED'}
 
 
@@ -1009,7 +1045,6 @@ class PLANETS_PT_main(bpy.types.Panel):
         box.label(text="Planetary Zone")
         col = box.column(align=True)
         col.prop(props, "gear_width")
-        col.prop(props, "gear_elongation")
         col.prop(props, "wall_thickness")
         row = box.row()
         row.enabled = False
@@ -1030,7 +1065,9 @@ class PLANETS_PT_main(bpy.types.Panel):
         # Planet teeth buttons
         sub = box.box()
         sub.label(text="Planet Teeth  [valid # planets]:")
-        entries = _valid_T_planet_entries(props.T_sun)
+        entries = _valid_T_planet_entries(props.T_sun,
+                                          props.cone_diameter / 2.0,
+                                          props.wall_thickness)
         grid    = sub.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
         for T_pl, valid_n in entries:
             label = f"{T_pl}  [{','.join(str(n) for n in valid_n)}]"
